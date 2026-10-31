@@ -1,0 +1,50 @@
+# dependencies
+node_modules/
+
+# Expo
+.expo/
+dist/
+web-build/
+expo-env.d.ts
+
+# Native
+*.orig.*
+*.jks
+*.p8
+*.p12
+*.key
+*.mobileprovision
+
+# Metro
+.metro-health-check*
+
+# debug
+npm-debug.*
+yarn-debug.*
+yarn-error.*
+
+# macOS
+.DS_Store
+
+# local env files
+.env*.local
+.env
+
+# typescript
+*.tsbuildinfo
+
+# Workflow agent working notes (plans, reviews, build logs) � not application code.
+.agents/
+
+# Git worktrees. A worktree directory holds a full second copy of the source and
+# must never be committed. `.worktrees/group-chat-media` WAS tracked (as a
+# gitlink), which is why that stale copy kept turning up in greps, in file
+# searches and in `tsc --noEmit` output — and the workaround was to exclude it by
+# hand in every command. Untracked and ignored instead.
+.worktrees/
+
+# Web verification build output (not source)
+.web-verify/
+
+# Stray build/verification screenshots
+android/*.png

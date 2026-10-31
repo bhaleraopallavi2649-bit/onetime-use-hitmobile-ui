@@ -1,0 +1,1127 @@
+import React, { useState, useEffect, useCallback } from 'react';
+import {
+  View, Text, TextInput, Pressable, ScrollView, Modal, Linking, ActivityIndicator, StyleSheet,
+} from 'react-native';
+import { Plus, Search, X, ChevronRight, AlertTriangle, Clock, Calendar, MapPin, CheckCircle2 } from 'lucide-react-native';
+import {
+  projectsApi, ProjectLite, ProjectAsset, humanLeadsApi,
+  HumanLead, LeadPerson, LeadStage, QUALIFIED_STAGE, LeadRequirementsInput,
+} from '../../lib/api';
+import { useSiteVisitTracking, SiteVisitTrackingState, DWELL_MS } from '../../hooks/useSiteVisitTracking';
+import { useToast } from '../Toast';
+import { useAuth } from '../../lib/authContext';
+import LeadDetailView from './LeadDetailView';
+import { colors } from '../../theme';
+
+export const PIPELINE_STAGES: LeadStage[] = [
+  'New Lead', 'Contacted', 'Qualified', 'Site Visit Scheduled',
+  'Site Visit Done', 'Negotiation', 'Booking', 'Won', 'Lost',
+];
+
+export type LeadType = 'inbound' | 'outbound';
+
+// ── Matching requirement options ──
+// These drive the structured fields the property matching engine reads. The
+// possession values are the exact keys the engine understands, so nothing has
+// to be translated between the form and the matcher.
+const TRANSACTION_TYPES: { v: 'buy' | 'rent'; l: string }[] = [
+  { v: 'buy', l: 'Buy' },
+  { v: 'rent', l: 'Rent' },
+];
+
+const POSSESSION_OPTIONS: { v: NonNullable<LeadRequirementsInput['possessionNeeded']>; l: string }[] = [
+  { v: 'ready', l: 'Ready to move' },
+  { v: 'immediate', l: 'Immediate' },
+  { v: '6months', l: '6 months' },
+  { v: '1year', l: '1 year' },
+  { v: '2year', l: '2+ years' },
+  { v: 'under_construction', l: 'Under construction' },
+];
+
+const AREA_UNITS: { v: 'sqft' | 'acres'; l: string }[] = [
+  { v: 'sqft', l: 'sq.ft' },
+  { v: 'acres', l: 'acres' },
+];
+
+// Home types that describe land rather than a built-up home. For these the
+// engine skips BHK scoring and uses AREA as the discriminator instead, so area
+// becomes the field that matters.
+const LAND_HOME_TYPES = ['Plot'];
+
+// Leads are real, team-scoped records from the backend (with ownership info)
+export type DemoLead = HumanLead;
+export type { LeadPerson };
+
+// Colors for the inbound/outbound lead-type badge
+export function leadTypeColor(type: LeadType): { bg: string; text: string; border: string } {
+  return type === 'inbound'
+    ? { bg: '#ECFDF5', text: '#047857', border: '#A7F3D0' }
+    : { bg: '#F5F3FF', text: '#6D28D9', border: '#DDD6FE' };
+}
+
+const HOME_TYPES = ['1 BHK', '2 BHK', '3 BHK', '4 BHK', '5 BHK+', 'Villa', 'Row House', 'Duplex', 'Penthouse', 'Plot', 'Shop', 'Office'];
+const BUYING_TYPES = ['Self-use', 'Investment', 'Rental income', 'Upgrade', 'Second home', 'NRI purchase'];
+const SOURCES = ['Meta Ad', 'WhatsApp', 'Website', 'Google Ad', 'Walk-in', 'Referral', 'Broker', 'Cold Database', 'Cold Call', 'Other'];
+
+// Quoted in the check-in copy instead of a hard-coded "5 minutes", so the number
+// on screen can never drift from the dwell the tracking engine actually enforces.
+const MS_PER_MINUTE = 60 * 1000;
+const DWELL_MINUTES = Math.round(DWELL_MS / MS_PER_MINUTE);
+
+/** One line describing where an in-progress site-visit check-in has got to. */
+function checkInStatusLabel(st: SiteVisitTrackingState): string {
+  switch (st.phase) {
+    case 'locating': return 'Locating…';
+    case 'watching': return st.distanceMeters === null ? 'Tracking…' : `Tracking · ${st.distanceMeters} m away`;
+    // Arrival is already recorded server-side at this point, so the useful thing
+    // to say is what still has to happen, not that something is pending.
+    case 'arrived': return `Arrived · completes after ${DWELL_MINUTES} min on site`;
+    case 'completed': return 'Visit completed';
+  }
+}
+
+export function stageColor(stage: string): { bg: string; text: string; border: string } {
+  switch (stage) {
+    case 'New Lead': return { bg: '#EFF6FF', text: '#1D4ED8', border: '#BFDBFE' };
+    case 'Contacted': return { bg: '#FFFBEB', text: '#B45309', border: '#FDE68A' };
+    case 'Qualified': return { bg: '#EEF2FF', text: '#4338CA', border: '#C7D2FE' };
+    case 'Site Visit Scheduled': return { bg: '#ECFEFF', text: '#0E7490', border: '#A5F3FC' };
+    case 'Site Visit Done': return { bg: '#FAF5FF', text: '#7E22CE', border: '#E9D5FF' };
+    case 'Negotiation': return { bg: '#FFF7ED', text: '#C2410C', border: '#FED7AA' };
+    case 'Booking': return { bg: '#FDF2F8', text: '#BE185D', border: '#FBCFE8' };
+    case 'Won': return { bg: '#F0FDF4', text: '#15803D', border: '#BBF7D0' };
+    case 'Lost': return { bg: '#FEF2F2', text: '#B91C1C', border: '#FECACA' };
+    default: return { bg: '#F5F5F4', text: '#57534E', border: '#E7E5E4' };
+  }
+}
+
+// The five filter buttons shown above the list, in one row. Leads in any other
+// stage (Won, Lost, ...) are still listed under "All"; only the quick filters are
+// limited to these.
+const FILTER_STAGES = ['All', 'New Lead', 'Contacted', 'Qualified', 'Site Visit Scheduled'] as const;
+
+export default function HumanLeadManager({ onNavigateToLearn }: { onNavigateToLearn?: () => void } = {}) {
+  const toast = useToast();
+  const { user } = useAuth();
+  // Only captains can (re)assign leads to their team agents
+  const canAssign = user?.role === 'captain';
+
+  const [leads, setLeads] = useState<DemoLead[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [saving, setSaving] = useState(false);
+  const [selectedLead, setSelectedLead] = useState<DemoLead | null>(null);
+  const [searchQuery, setSearchQuery] = useState('');
+  const [filterStage, setFilterStage] = useState('All');
+
+  const [schedulingLead, setSchedulingLead] = useState<DemoLead | null>(null);
+  const [visitDate, setVisitDate] = useState('');
+  const [visitTime, setVisitTime] = useState('');
+
+  const [showAddLead, setShowAddLead] = useState(false);
+  const [newLead, setNewLead] = useState({
+    name: '', phone: '', altPhone: '', email: '', budget: '',
+    homeType: '', buyingType: '', location: '', project: '',
+    source: 'Meta Ad', customSource: '', stage: 'New Lead' as LeadStage,
+    leadType: 'inbound' as LeadType,
+
+    // ── Structured matching fields ──
+    // Budget is entered in LAKHS for a purchase and rupees/month for a rental;
+    // they are different quantities so they get different inputs.
+    transactionType: 'buy' as 'buy' | 'rent',
+    budgetMin: '',
+    budgetMax: '',
+    rentMonthly: '',
+    city: '',
+    area: '',
+    areaUnit: 'sqft' as 'sqft' | 'acres',
+    possessionNeeded: '' as '' | NonNullable<LeadRequirementsInput['possessionNeeded']>,
+    loanRequired: false,
+  });
+  const [projectsList, setProjectsList] = useState<ProjectLite[]>([]);
+  const [teamAgents, setTeamAgents] = useState<{ id: string; name: string; role: string }[]>([]);
+  const [assigningLead, setAssigningLead] = useState<DemoLead | null>(null);
+
+  // Auto check-in. Scheduling itself is untouched (it already persists through
+  // humanLeadsApi.update); this only adds the geofence/dwell execution half, and
+  // exactly one visit is trackable at a time by design — see the hook.
+  const {
+    tracking: checkInActive,
+    start: startCheckIn,
+    stop: stopCheckIn,
+    state: checkInState,
+  } = useSiteVisitTracking();
+
+  const loadLeads = useCallback(async () => {
+    setLoading(true);
+    setLoadError(null);
+    try {
+      const data = await humanLeadsApi.list();
+      setLeads(data);
+    } catch {
+      setLoadError('Could not load leads.');
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => { loadLeads(); }, [loadLeads]);
+
+  useEffect(() => {
+    projectsApi.getAllPublic().then(setProjectsList).catch(() => {});
+  }, []);
+
+  useEffect(() => {
+    if (!canAssign) return;
+    humanLeadsApi.teamAgents().then(setTeamAgents).catch(() => {});
+  }, [canAssign]);
+
+  // Resolve the selected lead's project assets by matching project name
+  const assetsForLead = (lead: DemoLead): ProjectAsset[] =>
+    projectsList.find((p) => p.name === lead.project)?.assets || [];
+
+  const getSiteVisitAlert = (lead: DemoLead): 'missing' | 'close' | null => {
+    if (lead.stage !== 'Site Visit Scheduled') return null;
+    if (!lead.siteVisitDate || !lead.siteVisitTime) return 'missing';
+    const diffDays = (new Date(lead.siteVisitDate).getTime() - Date.now()) / 86400000;
+    if (diffDays <= 2 && diffDays >= 0) return 'close';
+    return null;
+  };
+
+  /**
+   * Resolve the lead's project id from the list that is ALREADY loaded above.
+   *
+   * HumanLead stores `project` as a NAME string, not an id — the same reason
+   * assetsForLead matches on `p.name`. Tracking needs the id (to read the
+   * project's latitude/longitude), so it comes from the same list rather than a
+   * second fetch.
+   */
+  const handleStartCheckIn = (lead: DemoLead) => {
+    const project = projectsList.find((p) => p.name === lead.project);
+    if (!project) {
+      toast.error('Link this lead to a project first');
+      return;
+    }
+    void startCheckIn({
+      leadId: lead.id,
+      leadName: lead.name,
+      projectId: project.id,
+      projectName: project.name,
+    });
+  };
+
+  const handleScheduleVisit = async () => {
+    if (!schedulingLead || !visitDate || !visitTime) return;
+    try {
+      const { lead: updated } = await humanLeadsApi.update(schedulingLead.id, { siteVisitDate: visitDate, siteVisitTime: visitTime });
+      setLeads((prev) => prev.map((l) => (l.id === updated.id ? updated : l)));
+      toast.success('Site visit scheduled');
+    } catch {
+      toast.error('Could not schedule visit');
+    }
+    setSchedulingLead(null); setVisitDate(''); setVisitTime('');
+  };
+
+  /**
+   * Build the structured requirements payload from the form.
+   *
+   * Derives bhkType/propertyType from the Home Type pill the agent already
+   * picked, so the same information is never asked for twice. Units are sent as
+   * entered and normalised server-side (budget → lakhs, area → sqft).
+   */
+  const buildRequirements = (): LeadRequirementsInput => {
+    const isRent = newLead.transactionType === 'rent';
+    const isLand = LAND_HOME_TYPES.includes(newLead.homeType);
+
+    const bhkMatch = newLead.homeType.match(/(\d+)\s*BHK/i);
+
+    const reqs: LeadRequirementsInput = {
+      transactionType: newLead.transactionType,
+      // Let the server's mapper canonicalise the label (e.g. "Row House" →
+      // row_house, "Shop" → retail) rather than duplicating that table here.
+      propertyType: newLead.homeType || null,
+      bhkType: bhkMatch ? `${bhkMatch[1]}BHK` : null,
+      locationRaw: newLead.location.trim() || null,
+      city: newLead.city.trim() || null,
+      loanRequired: newLead.loanRequired,
+      possessionNeeded: newLead.possessionNeeded || null,
+    };
+
+    if (isRent) {
+      reqs.rentBudgetMonthly = newLead.rentMonthly.trim() || null;
+    } else {
+      reqs.budget = newLead.budgetMin.trim() || null;
+      reqs.budgetMax = newLead.budgetMax.trim() || null;
+    }
+
+    if (newLead.area.trim()) {
+      reqs.area = newLead.area.trim();
+      reqs.areaUnit = newLead.areaUnit;
+    }
+
+    // Land leads are scored on area, not BHK.
+    if (isLand) reqs.bhkType = null;
+
+    return reqs;
+  };
+
+  /**
+   * Render the structured budget back into the legacy free-text `budget` field.
+   * That field is no longer typed by hand (it was replaced by the numeric
+   * inputs), but it is still part of the lead record and is what the server
+   * falls back to for older leads — so it must stay truthful rather than empty.
+   */
+  const legacyBudgetText = (): string => {
+    if (newLead.transactionType === 'rent') {
+      return newLead.rentMonthly.trim() ? `₹${newLead.rentMonthly.trim()}/mo` : '';
+    }
+    const min = newLead.budgetMin.trim();
+    const max = newLead.budgetMax.trim();
+    if (min && max) return `${min}L - ${max}L`;
+    if (min) return `${min}L`;
+    return '';
+  };
+
+  const resetNewLead = () => setNewLead({
+    name: '', phone: '', altPhone: '', email: '', budget: '',
+    homeType: '', buyingType: '', location: '', project: '',
+    source: 'Meta Ad', customSource: '', stage: 'New Lead',
+    leadType: 'inbound',
+    transactionType: 'buy', budgetMin: '', budgetMax: '', rentMonthly: '',
+    city: '', area: '', areaUnit: 'sqft', possessionNeeded: '', loanRequired: false,
+  });
+
+  const handleAddLead = async () => {
+    if (!newLead.name || !newLead.phone || saving) return;
+    setSaving(true);
+    try {
+      const created = await humanLeadsApi.create({
+        name: newLead.name,
+        phone: newLead.phone,
+        altPhone: newLead.altPhone,
+        email: newLead.email,
+        budget: legacyBudgetText(),
+        homeType: newLead.homeType,
+        buyingType: newLead.buyingType,
+        // Keep the legacy combined form ("Locality, City") so existing views
+        // and search behave exactly as before.
+        location: [newLead.location.trim(), newLead.city.trim()].filter(Boolean).join(', '),
+        projectName: newLead.project,
+        source: newLead.source === 'Other' ? newLead.customSource || 'Other' : newLead.source,
+        leadType: newLead.leadType,
+        stage: newLead.stage,
+        requirements: buildRequirements(),
+      });
+      setLeads((prev) => [created, ...prev]);
+      resetNewLead();
+      setShowAddLead(false);
+      toast.success('Lead added');
+    } catch (e: any) {
+      // Creating directly as "Qualified" is rejected when the requirements are
+      // incomplete — surface exactly what is missing instead of a generic error.
+      const missing = e?.data?.missing || e?.missing;
+      if (Array.isArray(missing) && missing.length) {
+        toast.error(`Add ${missing.join(', ')} to qualify this lead`);
+      } else {
+        toast.error(e?.message || 'Could not add lead');
+      }
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const handleAssign = async (leadId: string, agentId: string | null) => {
+    try {
+      const updated = await humanLeadsApi.assign(leadId, agentId);
+      setLeads((prev) => prev.map((l) => (l.id === updated.id ? updated : l)));
+      if (selectedLead?.id === updated.id) setSelectedLead(updated);
+      setAssigningLead(null);
+      toast.success(agentId ? 'Lead assigned' : 'Lead unassigned');
+    } catch {
+      toast.error('Could not update assignment');
+    }
+  };
+
+  const filteredLeads = leads.filter((lead) => {
+    const q = searchQuery.toLowerCase();
+    const matchesSearch = lead.name.toLowerCase().includes(q) || lead.project.toLowerCase().includes(q) || lead.phone.includes(searchQuery);
+    const matchesStage = filterStage === 'All' || lead.stage === filterStage;
+    return matchesSearch && matchesStage;
+  });
+
+  // ── Lead detail view ──
+  if (selectedLead) {
+    /**
+     * Move the open lead to a new stage.
+     *
+     * Owns ALL user feedback for the operation. Previously the detail view
+     * toasted "Moved to X" the instant the pill was tapped — before the request
+     * had even been sent — and a failure here reverted the UI silently, so the
+     * app could claim success and then quietly undo it.
+     *
+     * Moving to Qualified also runs real property matching server-side, so the
+     * outcome of that is reported too.
+     */
+    const handleStageChange = async (newStage: LeadStage) => {
+      const previous = selectedLead;
+
+      // Optimistic, so the pills feel instant.
+      setLeads((prev) => prev.map((l) => (l.id === previous.id ? { ...l, stage: newStage } : l)));
+      setSelectedLead({ ...previous, stage: newStage });
+
+      try {
+        const { lead: updated, matching } = await humanLeadsApi.updateStage(previous.id, newStage);
+        setLeads((prev) => prev.map((l) => (l.id === updated.id ? updated : l)));
+        setSelectedLead(updated);
+
+        if (newStage === QUALIFIED_STAGE && matching) {
+          if (matching.skippedReason === 'rent_not_supported') {
+            toast.show('Lead qualified. Rent matching is not available yet.', 'info');
+          } else if (matching.matches.length > 0) {
+            toast.success(
+              `Qualified — ${matching.matches.length} matching ${matching.matches.length === 1 ? 'property' : 'properties'} found`,
+            );
+          } else {
+            toast.show('Qualified. No matching property right now — we will match it when new inventory is added.', 'info');
+          }
+        } else {
+          toast.success(`Moved to ${newStage}`);
+        }
+      } catch (e: any) {
+        // Roll the optimistic change back to exactly what it was.
+        setLeads((prev) => prev.map((l) => (l.id === previous.id ? previous : l)));
+        setSelectedLead(previous);
+
+        const missing: string[] | undefined = e?.data?.missing;
+        if (e?.code === 'INCOMPLETE_REQUIREMENTS' && Array.isArray(missing) && missing.length) {
+          toast.error(`Cannot qualify yet — add: ${missing.join(', ')}`);
+        } else {
+          toast.error(e?.message || 'Could not update stage');
+        }
+        // Re-sync from the server in case the failure left us out of step.
+        loadLeads();
+      }
+    };
+
+    return (
+      <View style={s.outerCard}>
+        <LeadDetailView
+          lead={selectedLead}
+          onBack={() => setSelectedLead(null)}
+          stages={PIPELINE_STAGES}
+          onStageChange={handleStageChange}
+          projectAssets={assetsForLead(selectedLead)}
+        />
+      </View>
+    );
+  }
+
+  return (
+    <View style={s.outerCard}>
+      {/* Header */}
+      <View style={s.header}>
+        <View style={s.headerRow}>
+          <View>
+            <Text style={s.headerTitle}>Leads</Text>
+            <Text style={s.headerSub}>{filteredLeads.length} total leads</Text>
+          </View>
+          <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8 }}>
+            <Pressable
+              onPress={onNavigateToLearn}
+              style={({ pressed }) => [s.advBtn, pressed && s.btnPressed]}
+              accessibilityRole="button"
+              accessibilityLabel="Learn about lead qualification"
+            >
+              <Text style={s.advBtnText}>Learn</Text>
+            </Pressable>
+            <Pressable
+              onPress={() => setShowAddLead(true)}
+              style={({ pressed }) => [s.addBtn, pressed && s.btnPressed]}
+              accessibilityRole="button"
+              accessibilityLabel="Add a new lead"
+            >
+              <Plus size={18} color="#fff" strokeWidth={2.5} />
+              <Text style={s.addBtnText}>Add lead</Text>
+            </Pressable>
+          </View>
+        </View>
+
+        {/* Search */}
+        <View style={s.searchBar}>
+          <Search size={20} color={colors.muted2} />
+          <TextInput
+            placeholder="Search name or phone..."
+            placeholderTextColor={colors.muted}
+            value={searchQuery}
+            onChangeText={setSearchQuery}
+            style={s.searchInput}
+            returnKeyType="search"
+          />
+          {/* One tap to clear the search, so nobody has to delete letter by letter. */}
+          {searchQuery.length > 0 && (
+            <Pressable
+              onPress={() => setSearchQuery('')}
+              hitSlop={8}
+              style={s.searchClear}
+              accessibilityRole="button"
+              accessibilityLabel="Clear search"
+            >
+              <X size={16} color={colors.muted2} />
+            </Pressable>
+          )}
+        </View>
+
+        {/* Stage filter pills */}
+        {/* One line. The row is sized to fit the five buttons side by side; the
+            horizontal scroll is only a safety net for very narrow screens or a
+            large system font, so the buttons never wrap onto a second line. */}
+        <ScrollView
+          horizontal
+          showsHorizontalScrollIndicator={false}
+          contentContainerStyle={{ flexGrow: 1, justifyContent: 'space-between' }}
+        >
+          <View style={{ flexDirection: 'row', flexGrow: 1, justifyContent: 'space-between', gap: 4 }}>
+            {FILTER_STAGES.map((stage) => {
+              const active = filterStage === stage;
+              return (
+                <Pressable
+                  key={stage}
+                  onPress={() => setFilterStage(stage)}
+                  style={({ pressed }) => [s.filterPill, active ? s.pillActive : s.pillInactive, pressed && s.btnPressed]}
+                  accessibilityRole="button"
+                  accessibilityState={{ selected: active }}
+                >
+                  <Text numberOfLines={1} style={[s.filterPillText, { color: active ? '#fff' : colors.ink }]}>{stage}</Text>
+                </Pressable>
+              );
+            })}
+          </View>
+        </ScrollView>
+      </View>
+
+      {/* Lead list */}
+      <View>
+        {loading && (
+          <View style={s.centerPad}><ActivityIndicator color={colors.brand} /></View>
+        )}
+        {!loading && loadError && (
+          <View style={s.centerPad}>
+            <Text style={s.mutedSm}>{loadError}</Text>
+            <Pressable onPress={loadLeads} style={{ marginTop: 8 }}><Text style={s.brandBold}>Try again</Text></Pressable>
+          </View>
+        )}
+        {!loading && !loadError && filteredLeads.map((lead) => {
+          const alert = getSiteVisitAlert(lead);
+          const sc = stageColor(lead.stage);
+          return (
+            <Pressable
+              key={lead.id}
+              onPress={() => setSelectedLead(lead)}
+              style={({ pressed }) => [s.leadRow, alert && s.leadRowAlert, pressed && s.leadRowPressed]}
+              accessibilityRole="button"
+              accessibilityLabel={`Open lead ${lead.name}`}
+            >
+              {/* Orange accent bar on the left edge for a visit that needs attention. */}
+              {alert && <View style={s.alertBar} />}
+              <View style={s.cardTop}>
+              <View style={s.avatar}>
+                <Text style={s.avatarText}>{lead.name.split(' ').map((n) => n[0]).join('')}</Text>
+              </View>
+              <View style={{ flex: 1, minWidth: 0 }}>
+                {/* Name on the left, date + chevron on the right of the SAME line;
+                    the stage/type chips get the full width on the line below. */}
+                <Text style={s.leadName} numberOfLines={1}>{lead.name}</Text>
+                <View style={s.chipRow}>
+                  <View style={{ backgroundColor: sc.bg, borderColor: sc.border, borderWidth: 1, paddingHorizontal: 7, paddingVertical: 3, borderRadius: 8 }}>
+                    <Text style={{ color: sc.text, fontSize: 10, fontWeight: '700' }}>{lead.stage}</Text>
+                  </View>
+                  {(() => { const lt = leadTypeColor(lead.leadType); return (
+                    <View style={{ backgroundColor: lt.bg, borderColor: lt.border, borderWidth: 1, paddingHorizontal: 7, paddingVertical: 3, borderRadius: 8 }}>
+                      <Text style={{ color: lt.text, fontSize: 10, fontWeight: '700', textTransform: 'uppercase' }}>{lead.leadType}</Text>
+                    </View>
+                  ); })()}
+                </View>
+                <Text style={s.leadProject} numberOfLines={1}>{lead.project}</Text>
+
+                {/* Ownership — who brought the lead and who it's assigned to */}
+                <View style={{ marginTop: 4 }}>
+                  {lead.createdBy && (
+                    <Text style={s.ownerLine}>Added by <Text style={s.ownerBold}>{lead.createdBy.name}</Text> ({lead.createdBy.role})</Text>
+                  )}
+                  <Text style={s.ownerLine}>
+                    Assigned to <Text style={{ fontWeight: 'bold', color: lead.assignedAgent ? colors.brand : colors.muted }}>{lead.assignedAgent ? lead.assignedAgent.name : 'Unassigned'}</Text>
+                  </Text>
+                </View>
+
+                {/* Assign — captain only */}
+                {canAssign && (
+                  <Pressable onPress={() => setAssigningLead(lead)} style={s.assignBtn}>
+                    <Text style={s.assignBtnText}>{lead.assignedAgent ? 'Reassign' : 'Assign to agent'}</Text>
+                  </Pressable>
+                )}
+
+              </View>
+              {/* Date + chevron sit on the right edge, vertically centred on the
+                  card, as in the reference. */}
+              <View style={s.rightCol}>
+                <Text style={s.dateText}>{lead.date}</Text>
+                <ChevronRight size={18} color={colors.brand} />
+              </View>
+              </View>
+              {/* Site-visit alert, Schedule and check-in: full card width, indented
+                  to line up with the text beside the avatar, so they stay on one line. */}
+              <View style={s.alertWrap}>
+                {alert === 'missing' && (
+                  <View style={s.alertRow}>
+                    <AlertTriangle size={15} color="#EF4444" fill="#EF4444" stroke="#fff" />
+                    <Text style={s.alertText}>Visit date/time not set!</Text>
+                    <Pressable onPress={() => setSchedulingLead(lead)} hitSlop={6} style={({ pressed }) => [s.alertScheduleBtn, pressed && s.btnPressed]} accessibilityRole="button" accessibilityLabel={`Schedule site visit for ${lead.name}`}>
+                      <Text style={s.alertScheduleText}>Schedule</Text>
+                    </Pressable>
+                  </View>
+                )}
+                {alert === 'close' && (
+                  <View style={s.alertRow}>
+                    <Clock size={15} color="#EF4444" />
+                    <Text style={s.alertText}>Visit soon: {lead.siteVisitDate} at {lead.siteVisitTime}</Text>
+                  </View>
+                )}
+                {lead.stage === 'Site Visit Scheduled' && !alert && lead.siteVisitDate && (
+                  <View style={s.alertRow}>
+                    <Calendar size={15} color="#0E7490" />
+                    <Text style={{ fontSize: 12.5, fontWeight: '600', color: '#0E7490' }}>{lead.siteVisitDate} at {lead.siteVisitTime}</Text>
+                  </View>
+                )}
+
+                {/* ── Auto check-in ──
+                    Hangs off the scheduling that already exists rather than a
+                    second form: the date/time above is the schedule, this is the
+                    execution. Rendered for every scheduled visit with a date,
+                    including the 'close' alert case — that is precisely when an
+                    agent is on their way and wants to start tracking.
+
+                    "Works while the app is open" is there because it is TRUE and
+                    because the collaborator's version promised automatic
+                    check-in while requesting a background-location permission it
+                    never used. Foreground-only is the honest capability, so the
+                    copy states it instead of letting the agent assume the phone
+                    is watching from their pocket. */}
+                {lead.stage === 'Site Visit Scheduled' && lead.siteVisitDate && (
+                  checkInState?.leadId === lead.id ? (
+                    <View style={s.checkInBox}>
+                      <View style={s.checkInRow}>
+                        {checkInState.phase === 'completed'
+                          ? <CheckCircle2 size={12} color={colors.green} />
+                          : <MapPin size={12} color={colors.brand} />}
+                        <Text style={s.checkInStatus} numberOfLines={1}>{checkInStatusLabel(checkInState)}</Text>
+                        {/* Same control either way — it ends the session and
+                            clears this box — but a session that is already over
+                            is being dismissed, not stopped. */}
+                        <Pressable onPress={stopCheckIn} style={s.checkInStopBtn}>
+                          <Text style={s.checkInStopText}>
+                            {checkInState.phase === 'completed' || checkInState.error ? 'Dismiss' : 'Stop'}
+                          </Text>
+                        </Pressable>
+                      </View>
+                      {checkInState.error && <Text style={s.checkInError}>{checkInState.error}</Text>}
+                      <Text style={s.checkInHint}>Works while the app is open</Text>
+                    </View>
+                  ) : !checkInActive ? (
+                    <Pressable onPress={() => handleStartCheckIn(lead)} style={s.checkInBtn}>
+                      <MapPin size={11} color={colors.brand} />
+                      <Text style={s.checkInBtnText}>Start check-in</Text>
+                    </Pressable>
+                  ) : null
+                )}
+              </View>
+            </Pressable>
+          );
+        })}
+        {!loading && !loadError && filteredLeads.length === 0 && (
+          <View style={s.centerPad}>
+            <Text style={s.mutedSm}>No leads found</Text>
+            <Text style={[s.mutedSm, { marginTop: 4, fontSize: 11 }]}>Add a lead to get started.</Text>
+          </View>
+        )}
+      </View>
+
+      {/* Assign Agent Modal — captain/admin */}
+      <Modal visible={!!assigningLead} transparent animationType="fade" onRequestClose={() => setAssigningLead(null)}>
+        <View style={s.modalOverlayCenter}>
+          <View style={[s.modalCard, { maxWidth: 420 }]}>
+            <View style={s.modalHeader}>
+              <Text style={s.modalTitle}>Assign Lead</Text>
+              <Pressable onPress={() => setAssigningLead(null)}><X size={20} color={colors.muted} /></Pressable>
+            </View>
+            {assigningLead && (
+              <Text style={[s.mutedSm, { marginBottom: 12 }]}>Assign <Text style={{ fontWeight: 'bold', color: colors.ink }}>{assigningLead.name}</Text> to a team agent.</Text>
+            )}
+            <ScrollView style={{ maxHeight: 280 }} contentContainerStyle={{ gap: 8 }}>
+              <Pressable onPress={() => assigningLead && handleAssign(assigningLead.id, null)} style={s.agentRow}>
+                <Text style={{ fontSize: 13, fontWeight: '600', color: colors.muted2 }}>Unassigned</Text>
+                {!assigningLead?.assignedAgent && <Text style={s.brandBold}>Current</Text>}
+              </Pressable>
+              {teamAgents.length === 0 && (
+                <Text style={[s.mutedSm, { fontStyle: 'italic', paddingVertical: 8, textAlign: 'center' }]}>No team agents found.</Text>
+              )}
+              {teamAgents.map((a) => {
+                const isCurrent = assigningLead?.assignedAgent?.id === a.id;
+                return (
+                  <Pressable key={a.id} onPress={() => assigningLead && handleAssign(assigningLead.id, a.id)} style={[s.agentRow, isCurrent && { borderColor: colors.brand, backgroundColor: colors.brandTint }]}>
+                    <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8 }}>
+                      <View style={s.agentAvatar}>
+                        <Text style={{ fontSize: 10, fontWeight: 'bold', color: colors.brand }}>{a.name.split(' ').map((n) => n[0]).join('').slice(0, 2).toUpperCase()}</Text>
+                      </View>
+                      <Text style={{ fontSize: 13, fontWeight: '600', color: colors.ink }}>{a.name}</Text>
+                    </View>
+                    {isCurrent && <Text style={s.brandBold}>Current</Text>}
+                  </Pressable>
+                );
+              })}
+            </ScrollView>
+          </View>
+        </View>
+      </Modal>
+
+      {/* Site Visit Scheduling Modal */}
+      <Modal visible={!!schedulingLead} transparent animationType="fade" onRequestClose={() => setSchedulingLead(null)}>
+        <View style={s.modalOverlayCenter}>
+          <View style={[s.modalCard, { maxWidth: 420 }]}>
+            <View style={s.modalHeader}>
+              <Text style={s.modalTitle}>Schedule Site Visit</Text>
+              <Pressable onPress={() => { setSchedulingLead(null); setVisitDate(''); setVisitTime(''); }}><X size={20} color={colors.muted} /></Pressable>
+            </View>
+            {schedulingLead && (
+              <View style={s.leadChip}>
+                <View style={s.chipAvatar}>
+                  <Text style={{ fontSize: 11, fontWeight: 'bold', color: colors.brand }}>{schedulingLead.name.split(' ').map((n) => n[0]).join('')}</Text>
+                </View>
+                <View>
+                  <Text style={{ fontSize: 13, fontWeight: 'bold', color: colors.ink }}>{schedulingLead.name}</Text>
+                  <Text style={{ fontSize: 9, color: colors.muted }}>{schedulingLead.project}</Text>
+                </View>
+              </View>
+            )}
+            <Text style={s.fieldLabel}>Visit Date</Text>
+            <TextInput placeholder="YYYY-MM-DD" placeholderTextColor={colors.muted} value={visitDate} onChangeText={setVisitDate} style={[s.textInput, { marginBottom: 12 }]} />
+            <Text style={s.fieldLabel}>Visit Time</Text>
+            <TextInput placeholder="e.g. 11:00 AM" placeholderTextColor={colors.muted} value={visitTime} onChangeText={setVisitTime} style={[s.textInput, { marginBottom: 16 }]} />
+            <View style={{ flexDirection: 'row', gap: 8 }}>
+              <Pressable onPress={() => { setSchedulingLead(null); setVisitDate(''); setVisitTime(''); }} style={s.cancelBtn}>
+                <Text style={s.cancelBtnText}>Cancel</Text>
+              </Pressable>
+              <Pressable onPress={handleScheduleVisit} disabled={!visitDate || !visitTime} style={[s.confirmBtn, { opacity: !visitDate || !visitTime ? 0.4 : 1 }]}>
+                <Text style={s.confirmBtnText}>Schedule</Text>
+              </Pressable>
+            </View>
+          </View>
+        </View>
+      </Modal>
+
+      {/* Add Lead Modal */}
+      <Modal visible={showAddLead} transparent animationType="slide" onRequestClose={() => setShowAddLead(false)}>
+        <View style={s.modalOverlayBottom}>
+          <View style={s.sheet}>
+            <View style={s.sheetHeader}>
+              <Text style={s.modalTitle}>Add New Lead</Text>
+              <Pressable onPress={() => setShowAddLead(false)}><X size={22} color={colors.muted} /></Pressable>
+            </View>
+            <ScrollView contentContainerStyle={{ padding: 20, gap: 12 }}>
+              <LabeledInput label="Name *" placeholder="Client name" value={newLead.name} onChange={(v) => setNewLead((p) => ({ ...p, name: v }))} />
+              <View style={{ flexDirection: 'row', gap: 12 }}>
+                <View style={{ flex: 1 }}><LabeledInput label="Phone *" placeholder="+91 XXXXX" value={newLead.phone} onChange={(v) => setNewLead((p) => ({ ...p, phone: v }))} keyboardType="phone-pad" /></View>
+                <View style={{ flex: 1 }}><LabeledInput label="Alt. Number" placeholder="+91 XXXXX" value={newLead.altPhone} onChange={(v) => setNewLead((p) => ({ ...p, altPhone: v }))} keyboardType="phone-pad" /></View>
+              </View>
+              <LabeledInput label="Email" placeholder="client@email.com" value={newLead.email} onChange={(v) => setNewLead((p) => ({ ...p, email: v }))} keyboardType="email-address" />
+
+              <PillGroup label="Home Type" options={HOME_TYPES} selected={newLead.homeType} onSelect={(v) => setNewLead((p) => ({ ...p, homeType: v }))} />
+              <PillGroup label="Buying Type" options={BUYING_TYPES} selected={newLead.buyingType} onSelect={(v) => setNewLead((p) => ({ ...p, buyingType: v }))} />
+
+              {/* ── Requirement details used for property matching ──
+                  These are what the matching engine actually reads. City and
+                  budget are required before a lead can be qualified. */}
+              <View style={s.matchBlock}>
+                <Text style={s.matchBlockTitle}>Requirement details</Text>
+                <Text style={s.matchBlockHint}>Used to match real properties once the lead is qualified.</Text>
+
+                <OptionPills
+                  label="Looking to"
+                  options={TRANSACTION_TYPES}
+                  selected={newLead.transactionType}
+                  onSelect={(v) => v && setNewLead((p) => ({ ...p, transactionType: v }))}
+                />
+
+                {newLead.transactionType === 'rent' ? (
+                  <LabeledInput
+                    label="Monthly Rent (₹)"
+                    placeholder="e.g. 25000"
+                    value={newLead.rentMonthly}
+                    onChange={(v) => setNewLead((p) => ({ ...p, rentMonthly: v }))}
+                    keyboardType="numeric"
+                  />
+                ) : (
+                  <View style={{ flexDirection: 'row', gap: 12 }}>
+                    <View style={{ flex: 1 }}>
+                      <LabeledInput
+                        label="Budget from (₹ Lakhs) *"
+                        placeholder="e.g. 50"
+                        value={newLead.budgetMin}
+                        onChange={(v) => setNewLead((p) => ({ ...p, budgetMin: v }))}
+                        keyboardType="numeric"
+                      />
+                    </View>
+                    <View style={{ flex: 1 }}>
+                      <LabeledInput
+                        label="Budget to (₹ Lakhs)"
+                        placeholder="e.g. 65"
+                        value={newLead.budgetMax}
+                        onChange={(v) => setNewLead((p) => ({ ...p, budgetMax: v }))}
+                        keyboardType="numeric"
+                      />
+                    </View>
+                  </View>
+                )}
+
+                <View style={{ flexDirection: 'row', gap: 12 }}>
+                  <View style={{ flex: 1 }}>
+                    <LabeledInput label="Locality / Area" placeholder="e.g. Besa" value={newLead.location} onChange={(v) => setNewLead((p) => ({ ...p, location: v }))} />
+                  </View>
+                  <View style={{ flex: 1 }}>
+                    <LabeledInput label="City *" placeholder="e.g. Nagpur" value={newLead.city} onChange={(v) => setNewLead((p) => ({ ...p, city: v }))} />
+                  </View>
+                </View>
+
+                {/* Area matters most for plots and land, where the engine scores
+                    size instead of BHK — a land lead cannot be qualified without it. */}
+                <View style={{ flexDirection: 'row', gap: 12, alignItems: 'flex-end' }}>
+                  <View style={{ flex: 1 }}>
+                    <LabeledInput
+                      label={LAND_HOME_TYPES.includes(newLead.homeType) ? 'Area *' : 'Area'}
+                      placeholder="e.g. 1100"
+                      value={newLead.area}
+                      onChange={(v) => setNewLead((p) => ({ ...p, area: v }))}
+                      keyboardType="numeric"
+                    />
+                  </View>
+                  <View style={{ flex: 1 }}>
+                    <OptionPills
+                      label="Unit"
+                      options={AREA_UNITS}
+                      selected={newLead.areaUnit}
+                      onSelect={(v) => v && setNewLead((p) => ({ ...p, areaUnit: v }))}
+                    />
+                  </View>
+                </View>
+
+                <OptionPills
+                  label="Possession"
+                  options={POSSESSION_OPTIONS}
+                  selected={newLead.possessionNeeded}
+                  onSelect={(v) => setNewLead((p) => ({ ...p, possessionNeeded: v }))}
+                  allowClear
+                />
+
+                <Pressable
+                  onPress={() => setNewLead((p) => ({ ...p, loanRequired: !p.loanRequired }))}
+                  style={s.checkRow}
+                >
+                  <View style={[s.checkBox, newLead.loanRequired && s.checkBoxOn]}>
+                    {newLead.loanRequired && <Text style={s.checkMark}>✓</Text>}
+                  </View>
+                  <Text style={s.checkLabel}>Home loan required</Text>
+                </Pressable>
+              </View>
+
+              {/* Project Interest — from uploaded projects */}
+              <View>
+                <Text style={s.fieldLabel}>Project Interest</Text>
+                <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 6 }}>
+                  {projectsList.map((p) => {
+                    const active = newLead.project === p.name;
+                    return (
+                      <Pressable key={p.id} onPress={() => setNewLead((prev) => ({ ...prev, project: p.name }))} style={[s.pill, active ? s.pillActive : s.pillInactive]}>
+                        <Text style={[s.pillText, { color: active ? '#fff' : colors.muted2 }]}>{p.name}</Text>
+                      </Pressable>
+                    );
+                  })}
+                  {projectsList.length === 0 && (
+                    <LabeledInput label="" placeholder="Type project name" value={newLead.project} onChange={(v) => setNewLead((p) => ({ ...p, project: v }))} />
+                  )}
+                </View>
+              </View>
+
+              {/* Lead Type — Inbound vs Outbound */}
+              <View>
+                <Text style={s.fieldLabel}>Lead Type</Text>
+                <View style={{ flexDirection: 'row', gap: 8 }}>
+                  <Pressable
+                    onPress={() => setNewLead((p) => ({ ...p, leadType: 'inbound' }))}
+                    style={[s.leadTypeBtn, newLead.leadType === 'inbound' ? { backgroundColor: '#059669', borderColor: '#059669' } : { backgroundColor: colors.cream, borderColor: colors.line }]}
+                  >
+                    <Text style={[s.leadTypeTitle, { color: newLead.leadType === 'inbound' ? '#fff' : colors.muted2 }]}>Inbound</Text>
+                    <Text style={[s.leadTypeSub, { color: newLead.leadType === 'inbound' ? '#fff' : colors.muted }]}>Client ne khud enquiry ki</Text>
+                  </Pressable>
+                  <Pressable
+                    onPress={() => setNewLead((p) => ({ ...p, leadType: 'outbound' }))}
+                    style={[s.leadTypeBtn, newLead.leadType === 'outbound' ? { backgroundColor: '#7C3AED', borderColor: '#7C3AED' } : { backgroundColor: colors.cream, borderColor: colors.line }]}
+                  >
+                    <Text style={[s.leadTypeTitle, { color: newLead.leadType === 'outbound' ? '#fff' : colors.muted2 }]}>Outbound</Text>
+                    <Text style={[s.leadTypeSub, { color: newLead.leadType === 'outbound' ? '#fff' : colors.muted }]}>Cold / manually sourced</Text>
+                  </Pressable>
+                </View>
+              </View>
+
+              {/* Source with custom */}
+              <PillGroup label="Source" options={SOURCES} selected={newLead.source} onSelect={(v) => setNewLead((p) => ({ ...p, source: v }))} />
+              {newLead.source === 'Other' && (
+                <LabeledInput label="" placeholder="Enter custom source" value={newLead.customSource} onChange={(v) => setNewLead((p) => ({ ...p, customSource: v }))} />
+              )}
+
+              {/* Stage */}
+              <PillGroup label="Stage" options={PIPELINE_STAGES} selected={newLead.stage} onSelect={(v) => setNewLead((p) => ({ ...p, stage: v }))} />
+
+              <View style={{ flexDirection: 'row', gap: 8, marginTop: 8 }}>
+                <Pressable onPress={() => setShowAddLead(false)} style={s.cancelBtn}>
+                  <Text style={s.cancelBtnText}>Cancel</Text>
+                </Pressable>
+                <Pressable onPress={handleAddLead} disabled={!newLead.name || !newLead.phone || saving} style={[s.confirmBtn, { opacity: !newLead.name || !newLead.phone || saving ? 0.4 : 1 }]}>
+                  <Text style={s.confirmBtnText}>{saving ? 'Adding…' : 'Add Lead'}</Text>
+                </Pressable>
+              </View>
+            </ScrollView>
+          </View>
+        </View>
+      </Modal>
+    </View>
+  );
+}
+
+// ── Helpers ──
+function LabeledInput({ label, placeholder, value, onChange, keyboardType }: { label: string; placeholder: string; value: string; onChange: (v: string) => void; keyboardType?: any }) {
+  return (
+    <View>
+      {label ? <Text style={s.fieldLabel}>{label}</Text> : null}
+      <TextInput
+        placeholder={placeholder}
+        placeholderTextColor={colors.muted}
+        value={value}
+        onChangeText={onChange}
+        keyboardType={keyboardType}
+        autoCapitalize={keyboardType === 'email-address' ? 'none' : 'sentences'}
+        style={s.textInput}
+      />
+    </View>
+  );
+}
+
+// Generic over the option type so a group of typed values (e.g. LeadStage)
+// hands a correctly typed value back instead of a bare string.
+function PillGroup<T extends string>({ label, options, selected, onSelect }: {
+  label: string;
+  options: readonly T[];
+  selected: string;
+  onSelect: (v: T) => void;
+}) {
+  return (
+    <View>
+      <Text style={s.fieldLabel}>{label}</Text>
+      <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 6 }}>
+        {options.map((opt) => {
+          const active = selected === opt;
+          return (
+            <Pressable key={opt} onPress={() => onSelect(opt)} style={[s.pill, active ? s.pillActive : s.pillInactive]}>
+              <Text style={[s.pillText, { color: active ? '#fff' : colors.muted2 }]}>{opt}</Text>
+            </Pressable>
+          );
+        })}
+      </View>
+    </View>
+  );
+}
+
+/**
+ * A pill group over { value, label } options — used where the stored value is a
+ * machine key ('6months') but the agent should see a readable label ('6 months').
+ */
+function OptionPills<T extends string>({ label, options, selected, onSelect, allowClear = false }: {
+  label: string;
+  options: { v: T; l: string }[];
+  selected: string;
+  onSelect: (v: T | '') => void;
+  allowClear?: boolean;
+}) {
+  return (
+    <View>
+      <Text style={s.fieldLabel}>{label}</Text>
+      <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 6 }}>
+        {options.map((opt) => {
+          const active = selected === opt.v;
+          return (
+            <Pressable
+              key={opt.v}
+              onPress={() => onSelect(active && allowClear ? '' : opt.v)}
+              style={[s.pill, active ? s.pillActive : s.pillInactive]}
+            >
+              <Text style={[s.pillText, { color: active ? '#fff' : colors.muted2 }]}>{opt.l}</Text>
+            </Pressable>
+          );
+        })}
+      </View>
+    </View>
+  );
+}
+
+// Reference palette for this screen (estimated by eye from the reference image,
+// which cannot be sampled for exact values): the board, search field, filter
+// buttons and lead cards all sit on a warm cream "paper" tone rather than pure
+// white; the search field is a touch deeper than the board.
+const REF = {
+  board: '#FFF9F2',
+  boardBorder: '#EFE2D2',
+  field: '#FBF2E6',
+  fieldBorder: '#E8D9C5',
+  chip: '#FFF9F2',
+  chipBorder: '#E8D9C5',
+  card: '#FFFBF6',
+} as const;
+
+const s = StyleSheet.create({
+  // No outer sheet: the header block and every lead are their own rounded cards
+  // on the cream page, as in the reference.
+  outerCard: { paddingHorizontal: 12, paddingTop: 12, gap: 10 },
+  header: {
+    padding: 14, borderRadius: 18, backgroundColor: REF.board,
+    borderWidth: 1, borderColor: REF.boardBorder,
+    shadowColor: colors.brandDark, shadowOpacity: 0.08, shadowRadius: 8, shadowOffset: { width: 0, height: 2 }, elevation: 2,
+  },
+  headerRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginBottom: 14 },
+  headerTitle: { fontSize: 26, fontWeight: '700', color: colors.ink, letterSpacing: -0.3 },
+  headerSub: { fontSize: 13, color: colors.muted2, marginTop: 2 },
+  // Buttons: 44dp+ tall so they are easy to hit, clear label, pressed feedback.
+  advBtn: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', minHeight: 40, paddingHorizontal: 16, borderRadius: 12, borderWidth: 1, borderColor: REF.chipBorder, backgroundColor: REF.chip },
+  advBtnText: { fontSize: 13, fontWeight: '600', color: colors.ink },
+  addBtn: {
+    flexDirection: 'row', alignItems: 'center', gap: 5, minHeight: 40, paddingHorizontal: 14, backgroundColor: colors.brand, borderRadius: 12,
+    shadowColor: colors.brandDark, shadowOpacity: 0.25, shadowRadius: 6, shadowOffset: { width: 0, height: 3 }, elevation: 3,
+  },
+  addBtnText: { color: '#fff', fontSize: 13, fontWeight: '700' },
+  btnPressed: { opacity: 0.7 },
+  // Reference search bar: white rounded field, grey magnifier, light grey
+  // placeholder in a regular weight, thin warm border.
+  searchBar: {
+    flexDirection: 'row', alignItems: 'center', backgroundColor: REF.field,
+    borderWidth: 1, borderColor: REF.fieldBorder, borderRadius: 13, paddingHorizontal: 12, minHeight: 44, marginBottom: 12,
+  },
+  searchInput: { flex: 1, paddingVertical: 9, paddingHorizontal: 8, fontSize: 14, fontWeight: '400', color: colors.ink },
+  searchClear: { width: 32, height: 32, borderRadius: 16, alignItems: 'center', justifyContent: 'center', backgroundColor: colors.slateBg },
+  // Sized from a real device capture: at font 11 / padding 9 the five labels
+  // needed ~381dp and the row only has ~358dp, so "Site Visit Scheduled" was
+  // cut off. Font 10 / padding 6 / gap 4 needs ~325dp, leaving room to spare.
+  filterPill: { minHeight: 36, paddingHorizontal: 8, borderRadius: 18, alignItems: 'center', justifyContent: 'center' },
+  filterPillText: { fontSize: 10, fontWeight: '700' },
+  pill: { paddingHorizontal: 10, paddingVertical: 6, borderRadius: 8 },
+  // Selected button: solid orange with a soft orange shadow, as in the reference.
+  pillActive: {
+    backgroundColor: colors.brand, borderWidth: 1, borderColor: colors.brandDark,
+    shadowColor: colors.brandDark, shadowOpacity: 0.3, shadowRadius: 5, shadowOffset: { width: 0, height: 2 }, elevation: 3,
+  },
+  // Unselected: cream pill with a thin beige outline and navy text.
+  pillInactive: { backgroundColor: REF.chip, borderWidth: 1, borderColor: REF.chipBorder },
+  pillText: { fontSize: 10, fontWeight: 'bold' },
+  centerPad: { paddingVertical: 48, alignItems: 'center' },
+  mutedSm: { fontSize: 13, color: colors.muted },
+  brandBold: { fontSize: 11, fontWeight: 'bold', color: colors.brand },
+  // Each lead is its own card: white, rounded, soft shadow. A visit that needs
+  // attention gets an orange accent bar on the left instead of a pink wash.
+  leadRow: {
+    flexDirection: 'column', alignItems: 'stretch', paddingVertical: 12, paddingHorizontal: 12, minHeight: 84,
+    backgroundColor: REF.card, borderRadius: 18, borderWidth: 1, borderColor: REF.boardBorder, overflow: 'hidden',
+    shadowColor: colors.brandDark, shadowOpacity: 0.08, shadowRadius: 8, shadowOffset: { width: 0, height: 2 }, elevation: 2,
+  },
+  leadRowAlert: { backgroundColor: '#FFFAF5' },
+  // Top of the card: avatar | info | date + chevron.
+  cardTop: { flexDirection: 'row', alignItems: 'center', gap: 8 },
+  // Alert / Schedule / check-in row under the card body. Indented by avatar width
+  // + gap (48 + 8) so it lines up with the text, and given the card's full width
+  // so "Visit date/time not set!" and "Schedule" stay on one line.
+  alertWrap: { marginLeft: 56 },
+  alertBar: { position: 'absolute', left: 0, top: 0, bottom: 0, width: 5, backgroundColor: colors.brand },
+  nameRow: { flexDirection: 'row', alignItems: 'center', gap: 8 },
+  chipRow: { flexDirection: 'row', alignItems: 'center', flexWrap: 'wrap', gap: 5, marginTop: 4 },
+  // Right edge of the card: date + chevron, centred vertically (reference).
+  rightCol: { flexDirection: 'row', alignItems: 'center', gap: 2, flexShrink: 0 },
+  leadRowPressed: { opacity: 0.85, backgroundColor: colors.cream },
+  avatar: {
+    width: 48, height: 48, borderRadius: 24, backgroundColor: colors.brand, alignItems: 'center', justifyContent: 'center',
+    shadowColor: colors.brandDark, shadowOpacity: 0.3, shadowRadius: 5, shadowOffset: { width: 0, height: 3 }, elevation: 3,
+  },
+  avatarText: { fontSize: 16, fontWeight: '700', color: '#fff' },
+  leadName: { fontSize: 15, fontWeight: '700', color: colors.ink },
+  leadProject: { fontSize: 13, fontWeight: '700', color: colors.ink, marginTop: 3 },
+  ownerLine: { fontSize: 11, color: colors.muted2, lineHeight: 15 },
+  ownerBold: { fontWeight: '600', color: colors.ink },
+  assignBtn: { marginTop: 8, alignSelf: 'flex-start', minHeight: 36, justifyContent: 'center', paddingHorizontal: 12, borderRadius: 10, backgroundColor: colors.white, borderWidth: 1, borderColor: colors.brand },
+  assignBtnText: { fontSize: 12.5, fontWeight: '700', color: colors.brand },
+  alertRow: { flexDirection: 'row', alignItems: 'center', flexWrap: 'wrap', gap: 5, marginTop: 5 },
+  alertText: { fontSize: 11.5, fontWeight: '700', color: '#DC2626' },
+  alertScheduleBtn: { marginLeft: 2, minHeight: 30, justifyContent: 'center', paddingHorizontal: 10, borderRadius: 9, backgroundColor: '#FEE2E2' },
+  alertScheduleText: { fontSize: 11.5, fontWeight: '700', color: '#B91C1C' },
+
+  // Site-visit auto check-in. White/cream card on the neutral line colour with a
+  // brand-orange action, matching the established card palette; only the error
+  // line and the completed tick carry their own colour, because those two mean
+  // something.
+  checkInBtn: { flexDirection: 'row', alignItems: 'center', gap: 6, marginTop: 8, alignSelf: 'flex-start', minHeight: 38, paddingHorizontal: 12, borderRadius: 10, backgroundColor: colors.brandTint, borderWidth: 1, borderColor: colors.brand },
+  checkInBtnText: { fontSize: 12.5, fontWeight: '700', color: colors.brand },
+  checkInBox: { marginTop: 8, paddingHorizontal: 10, paddingVertical: 8, borderRadius: 10, backgroundColor: colors.cream, borderWidth: 1, borderColor: colors.line, gap: 3 },
+  checkInRow: { flexDirection: 'row', alignItems: 'center', gap: 6 },
+  checkInStatus: { flex: 1, fontSize: 12, fontWeight: '700', color: colors.muted2 },
+  checkInStopBtn: { minHeight: 32, justifyContent: 'center', paddingHorizontal: 12, borderRadius: 8, backgroundColor: colors.white, borderWidth: 1, borderColor: colors.line },
+  checkInStopText: { fontSize: 12, fontWeight: '700', color: colors.ink },
+  checkInHint: { fontSize: 11, color: colors.muted2 },
+  checkInError: { fontSize: 11, fontWeight: '700', color: colors.red },
+
+  dateText: { fontSize: 11.5, fontWeight: '600', color: colors.ink },
+  modalOverlayCenter: { flex: 1, alignItems: 'center', justifyContent: 'center', backgroundColor: 'rgba(0,0,0,0.4)', padding: 16 },
+  modalOverlayBottom: { flex: 1, justifyContent: 'flex-end', backgroundColor: 'rgba(0,0,0,0.4)' },
+  modalCard: { backgroundColor: colors.white, borderRadius: 16, borderWidth: 1, borderColor: colors.line, width: '100%', padding: 24 },
+  modalHeader: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginBottom: 16 },
+  modalTitle: { fontSize: 15, fontWeight: 'bold', color: colors.ink },
+  agentRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingHorizontal: 12, paddingVertical: 12, borderRadius: 12, borderWidth: 1, borderColor: colors.line },
+  agentAvatar: { width: 32, height: 32, borderRadius: 999, backgroundColor: colors.brandTint, alignItems: 'center', justifyContent: 'center' },
+  leadChip: { flexDirection: 'row', alignItems: 'center', gap: 12, padding: 12, borderRadius: 12, backgroundColor: colors.cream, borderWidth: 1, borderColor: colors.line, marginBottom: 12 },
+  chipAvatar: { width: 36, height: 36, borderRadius: 999, backgroundColor: colors.brandTint, alignItems: 'center', justifyContent: 'center' },
+  fieldLabel: { fontSize: 11, fontWeight: 'bold', color: colors.muted2, marginBottom: 4 },
+  textInput: { borderWidth: 1, borderColor: colors.line, borderRadius: 12, paddingHorizontal: 12, paddingVertical: 10, fontSize: 13, color: colors.ink },
+
+  // Requirement details block inside the Add Lead sheet
+  matchBlock: {
+    backgroundColor: colors.cream,
+    borderWidth: 1,
+    borderColor: colors.line,
+    borderRadius: 12,
+    padding: 12,
+    gap: 12,
+  },
+  matchBlockTitle: { fontSize: 12, fontWeight: 'bold', color: colors.ink },
+  matchBlockHint: { fontSize: 10, color: colors.muted, marginTop: -8 },
+  checkRow: { flexDirection: 'row', alignItems: 'center', gap: 8 },
+  checkBox: {
+    width: 20, height: 20, borderRadius: 5,
+    borderWidth: 1, borderColor: colors.line,
+    backgroundColor: '#fff',
+    alignItems: 'center', justifyContent: 'center',
+  },
+  checkBoxOn: { backgroundColor: colors.brand, borderColor: colors.brand },
+  checkMark: { color: '#fff', fontSize: 12, fontWeight: 'bold' },
+  checkLabel: { fontSize: 12, fontWeight: '600', color: colors.muted2 },
+  cancelBtn: { flex: 1, paddingVertical: 10, borderRadius: 12, borderWidth: 1, borderColor: colors.line, alignItems: 'center' },
+  cancelBtnText: { fontSize: 13, fontWeight: 'bold', color: colors.muted2 },
+  confirmBtn: { flex: 1, paddingVertical: 10, borderRadius: 12, backgroundColor: colors.brand, alignItems: 'center' },
+  confirmBtnText: { fontSize: 13, fontWeight: 'bold', color: '#fff' },
+  sheet: { backgroundColor: colors.white, borderTopLeftRadius: 24, borderTopRightRadius: 24, maxHeight: '92%' },
+  sheetHeader: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', padding: 20, borderBottomWidth: 1, borderBottomColor: colors.line },
+  leadTypeBtn: { flex: 1, paddingHorizontal: 12, paddingVertical: 10, borderRadius: 12, borderWidth: 1, alignItems: 'center' },
+  leadTypeTitle: { fontSize: 11, fontWeight: 'bold' },
+  leadTypeSub: { fontSize: 8, marginTop: 2 },
+});
